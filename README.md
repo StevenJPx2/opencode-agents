@@ -40,7 +40,7 @@ For example:
 
 ### Nesting and siblings
 
-Spawned agents get the same tools. An agent can spawn its own agents up to `maxDepth` levels below the session you started, and can message its siblings by name. Messages to siblings never wait, so two agents waiting on each other cannot deadlock; the reply comes back as a notification. Only the session that spawned an agent can stop it.
+Spawned agents get the same tools. An agent can spawn its own agents and message its siblings by name. The plugin imposes no limit on the number of agents or their nesting depth. Messages to siblings never wait, so two agents waiting on each other cannot deadlock; the reply comes back as a notification. Only the session that spawned an agent can stop it.
 
 Spawned sessions inherit the permission rules of the session that created them.
 
@@ -51,17 +51,31 @@ Pass options with the object form:
 ```jsonc
 {
   "plugins": [
-    { "package": "/path/to/opencode-agents", "options": { "maxAgents": 4 } }
+    { "package": "/path/to/opencode-agents", "options": { "timeoutSeconds": 120 } }
   ]
 }
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
-| `maxDepth` | `2` | Levels of spawned agents allowed below a session you started |
-| `maxAgents` | `8` | Agents one session may have at once |
 | `timeoutSeconds` | `600` | Default wait for a reply before it is delivered as a notification |
 | `codemode` | `false` | Put the tools in Code Mode under `agents` instead of listing them directly |
+
+## Chauffeur skill
+
+The usage skill lives in [`skills/opencode-agents/SKILL.md`](skills/opencode-agents/SKILL.md). To let Chauffeur select it for delegation tasks, add this source to the existing `sources` array in `~/.config/chauffeur/skill-sources.json`:
+
+```json
+{
+  "id": "opencode-agents",
+  "type": "git",
+  "url": "https://github.com/StevenJPx2/opencode-agents.git",
+  "ref": "master",
+  "paths": ["skills/opencode-agents"]
+}
+```
+
+To keep the tools available, include `agents_spawn`, `agents_send`, `agents_read`, `agents_list`, and `agents_stop` in Chauffeur's `tool-exposure.json` `base` list, preserving its other entries. The skill explains using them; it does not authorize delegation that the user or project instructions prohibit.
 
 ## Development
 

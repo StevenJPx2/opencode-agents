@@ -1,8 +1,9 @@
 import { Plugin } from "@opencode/plugin"
+import { listChildren } from "./sessions.ts"
 import type { Message } from "./transcript.ts"
 import { MARKER_KEY, Team, type Delivery, type Host, type SessionInfo } from "./team.ts"
 
-const DEFAULTS = { maxDepth: 2, maxAgents: 8, timeoutSeconds: 600 }
+const DEFAULT_TIMEOUT_SECONDS = 600
 
 function positive(option: unknown, fallback: number): number {
   return typeof option === "number" && Number.isInteger(option) && option > 0 ? option : fallback
@@ -47,7 +48,7 @@ const TIMEOUT = {
 export default Plugin.define({
   id: "opencode-agents",
   async setup(ctx) {
-    const timeoutMs = positive(ctx.options.timeoutSeconds, DEFAULTS.timeoutSeconds) * 1000
+    const timeoutMs = positive(ctx.options.timeoutSeconds, DEFAULT_TIMEOUT_SECONDS) * 1000
     const codemode = ctx.options.codemode === true
 
     const host: Host = {
@@ -56,12 +57,12 @@ export default Plugin.define({
           parentID: input.parentID,
           title: input.title,
           location: { directory: input.directory },
-          metadata: { [MARKER_KEY]: { name: input.marker.name, depth: input.marker.depth } },
+          metadata: { [MARKER_KEY]: { name: input.marker.name } },
           ...(input.agent ? { agent: input.agent } : {}),
           ...(input.model ? { model: input.model } : {}),
         })) as SessionInfo,
       get: async (sessionID) => (await ctx.session.get({ sessionID })) as SessionInfo,
-      children: async (parentID) => (await ctx.session.list({ parentID, limit: 100 })).data as ReadonlyArray<SessionInfo>,
+      children: (parentID) => listChildren(ctx.session.list, parentID),
       prompt: async (sessionID, text, delivery) => String((await ctx.session.prompt({ sessionID, text, delivery })).id),
       wait: (sessionID, signal) => ctx.session.wait({ sessionID }, { signal }),
       context: async (sessionID) => (await ctx.session.context({ sessionID })) as unknown as ReadonlyArray<Message>,
@@ -74,11 +75,7 @@ export default Plugin.define({
       },
     }
 
-    const team = new Team(host, {
-      maxDepth: positive(ctx.options.maxDepth, DEFAULTS.maxDepth),
-      maxAgents: positive(ctx.options.maxAgents, DEFAULTS.maxAgents),
-      timeoutMs,
-    })
+    const team = new Team(host, { timeoutMs })
 
     await ctx.tool.transform((editor) => {
       editor.namespace({

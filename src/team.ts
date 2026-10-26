@@ -16,7 +16,7 @@ export type SessionInfo = {
   readonly location: { readonly directory: string }
 }
 
-export type Marker = { readonly name: string; readonly depth: number }
+export type Marker = { readonly name: string }
 
 export type Delivery = "steer" | "queue"
 
@@ -44,10 +44,6 @@ export interface Host {
 }
 
 export type TeamOptions = {
-  /** How many levels of spawned agents may exist below a session the user started. */
-  readonly maxDepth: number
-  /** Agents one session may have spawned at once. */
-  readonly maxAgents: number
   /** How long a call waits for a reply before handing the wait to a background watcher. */
   readonly timeoutMs: number
 }
@@ -59,9 +55,9 @@ export function markerOf(info: SessionInfo): Marker | undefined {
 
   if (typeof value !== "object" || value === null) return undefined
 
-  const { name, depth } = value as Record<string, unknown>
+  const { name } = value as Record<string, unknown>
 
-  return typeof name === "string" && typeof depth === "number" ? { name, depth } : undefined
+  return typeof name === "string" ? { name } : undefined
 }
 
 /** `provider/model` or `provider/model#variant`. */
@@ -172,18 +168,7 @@ export class Team {
     signal: AbortSignal,
   ): Promise<string> {
     const caller = await this.host.get(callerID)
-    const depth = (markerOf(caller)?.depth ?? 0) + 1
-
-    if (depth > this.options.maxDepth) {
-      throw new Error(`Spawned agents may nest ${this.options.maxDepth} level${this.options.maxDepth === 1 ? "" : "s"} deep; this session cannot spawn more. Do the work here or report back instead.`)
-    }
-
     const existing = (await this.members(caller)).filter((member) => member.relation === "child")
-
-    if (existing.length >= this.options.maxAgents) {
-      throw new Error(`This session already has ${existing.length} agents, the most allowed. Close one with agents_stop (remove: true) first.`)
-    }
-
     const name = uniqueName(input.name ?? input.agent ?? "agent", existing.map((member) => member.name))
     const model = input.model ? parseModel(input.model) : undefined
     const directory = input.directory
@@ -194,7 +179,7 @@ export class Team {
       parentID: caller.id,
       title: name,
       directory,
-      marker: { name, depth },
+      marker: { name },
       ...(input.agent ? { agent: input.agent } : {}),
       ...(model ? { model } : {}),
     })

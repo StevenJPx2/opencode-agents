@@ -5,7 +5,7 @@ import { MARKER_KEY, parseModel, Team, uniqueName, type Host, type SessionInfo }
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
 
 /** An in-memory OpenCode where each prompt is answered with "echo: <text>" once `finish` is called. */
-function harness(options = { maxDepth: 2, maxAgents: 3, timeoutMs: 1_000 }) {
+function harness(options = { timeoutMs: 1_000 }) {
   const sessions = new Map<string, SessionInfo>([["ses_root", { id: "ses_root", location: { directory: "/work" } }]])
   const messages = new Map<string, Message[]>()
   const notes: Array<{ sessionID: string; text: string }> = []
@@ -96,7 +96,7 @@ test("spawn creates a marked child session and returns its first reply", async (
 
   const child = [...sessions.values()].find((info) => info.parentID === "ses_root")
 
-  expect(child?.metadata?.[MARKER_KEY]).toEqual({ name: "explore", depth: 1 })
+  expect(child?.metadata?.[MARKER_KEY]).toEqual({ name: "explore" })
   expect(child?.location.directory).toBe("/work")
 })
 
@@ -142,7 +142,7 @@ test("a background message notifies the sender when the reply arrives", async ()
 })
 
 test("a wait that times out hands over to a background notification", async () => {
-  const { team, notes, hold, finish, sessions } = harness({ maxDepth: 2, maxAgents: 3, timeoutMs: 20 })
+  const { team, notes, hold, finish, sessions } = harness({ timeoutMs: 20 })
 
   hold()
 
@@ -172,16 +172,20 @@ test("stopping the caller while it waits interrupts the agent", async () => {
   expect(interrupted).toHaveLength(1)
 })
 
-test("depth and count limits are enforced", async () => {
-  const { team, sessions } = harness({ maxDepth: 1, maxAgents: 2, timeoutMs: 1_000 })
+test("agents can spawn agents of their own, with no limit on count or depth", async () => {
+  const { team, sessions } = harness()
 
-  await team.spawn("ses_root", { prompt: "a", wait: false }, never)
-  await team.spawn("ses_root", { prompt: "b", wait: false }, never)
-  await expect(team.spawn("ses_root", { prompt: "c", wait: false }, never)).rejects.toThrow("already has 2 agents")
+  for (let index = 0; index < 12; index += 1) await team.spawn("ses_root", { prompt: `task ${index}`, wait: false }, never)
 
-  const child = [...sessions.values()].find((info) => info.parentID === "ses_root")!
+  let parent = "ses_root"
 
-  await expect(team.spawn(child.id, { prompt: "deeper", wait: false }, never)).rejects.toThrow("nest 1 level deep")
+  for (let level = 0; level < 5; level += 1) {
+    await team.spawn(parent, { prompt: "go deeper", name: "deeper", wait: true }, never)
+    parent = [...sessions.values()].findLast((info) => info.parentID === parent)!.id
+  }
+
+  expect([...sessions.values()].filter((info) => info.parentID === "ses_root")).toHaveLength(13)
+  expect(sessions.get(parent)?.title).toBe("deeper")
 })
 
 test("spawned agents can message siblings without waiting, but cannot stop them", async () => {
