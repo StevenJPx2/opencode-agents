@@ -179,7 +179,7 @@ test("any session can be messaged by ID, but not the caller itself", async () =>
   expect(await agents.send("ses_root", { to: "ses_away", message: say("hello"), delivery: "steer" })).toContain('Sent to session "Elsewhere" (ses_away)')
   expect(prompts.at(-1)?.sessionID).toBe("ses_away")
   await expect(agents.send("ses_root", { to: "ses_root", message: say("me"), delivery: "steer" })).rejects.toThrow("That is this session")
-  await expect(agents.send("ses_root", { to: "ses_missing", message: say("?"), delivery: "steer" })).rejects.toThrow("not found")
+  await expect(agents.send("ses_root", { to: "ses_missing", message: say("?"), delivery: "steer" })).rejects.toThrow("No session ses_missing exists.")
 })
 
 test("read reports status and the latest reply, or a transcript, without waiting", async () => {

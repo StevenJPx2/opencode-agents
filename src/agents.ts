@@ -152,7 +152,8 @@ export class Agents {
   private async resolve(caller: SessionInfo, ref: string): Promise<SessionInfo> {
     const wanted = ref.trim()
 
-    if (SESSION_ID.test(wanted)) return this.host.get(wanted)
+    // OpenCode's not-found error reaches the model without its message, so name the session here.
+    if (SESSION_ID.test(wanted)) return this.host.get(wanted).catch(() => Promise.reject(new Error(`No session ${wanted} exists.`)))
 
     const named = (infos: ReadonlyArray<SessionInfo>) => infos.filter((info) => markerOf(info)?.name === wanted.toLowerCase())
     const local = await this.agents(caller.projectID)
