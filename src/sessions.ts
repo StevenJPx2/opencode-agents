@@ -1,17 +1,17 @@
-type ListInput = { readonly parentID?: string; readonly cursor?: string; readonly limit: number }
+type ListInput = { readonly project?: string; readonly cursor?: string; readonly limit: number }
 type Page<T> = { readonly data: ReadonlyArray<T>; readonly cursor: { readonly next?: string | null | undefined } }
 
-/** Follow every page so all spawned agents remain addressable, not just the first 100. */
-export async function listChildren<T>(list: (input: ListInput) => Promise<Page<T>>, parentID: string): Promise<T[]> {
-  const children: T[] = []
-  let page = await list({ parentID, limit: 100 })
+/** Follows every page so all agents remain addressable, not just the first 100 sessions. */
+export async function listSessions<T>(list: (input: ListInput) => Promise<Page<T>>, projectID: string | undefined): Promise<T[]> {
+  const sessions: T[] = []
+  let page = await list(projectID === undefined ? { limit: 100 } : { project: projectID, limit: 100 })
 
   for (;;) {
-    children.push(...page.data)
+    sessions.push(...page.data)
 
-    if (!page.cursor.next) return children
+    if (!page.cursor.next) return sessions
 
-    // The cursor remembers the parent filter.
+    // The cursor remembers the project filter.
     page = await list({ cursor: page.cursor.next, limit: 100 })
   }
 }

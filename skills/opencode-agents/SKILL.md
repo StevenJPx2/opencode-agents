@@ -1,49 +1,60 @@
 ---
 name: opencode-agents
-description: Use when delegating work to OpenCode agents, running independent tasks in parallel, asking another agent for a review, or continuing a conversation with a spawned agent. Covers agents_spawn, agents_send, agents_read, agents_list, and agents_stop, background notifications, sibling messaging, and shared-file coordination.
+description: Use when spawning another OpenCode agent, messaging an agent or another session, replying to a message headed "[opencode-agents]", running work in parallel across agents, or asking another agent for a review. Covers the agents tools (spawn, send, read, list, stop), reached in Code Mode as tools.agents.* or directly as agents_*.
 ---
 
 # OpenCode agents
 
-Use the `opencode-agents` plugin tools for named agents that keep their own conversation across tasks. Follow user and project restrictions on delegation; tool availability and this skill are not permission to delegate on their own.
+The `opencode-agents` plugin lets you spawn agents and talk to them as peers. Each agent is an ordinary top-level session: it appears in the user's session history, and the user can open it and talk to it directly. Follow user and project restrictions on delegation; the tools being available is not permission to delegate.
 
-## Start and continue a conversation
+## Calling the tools
 
-- `agents_spawn`: give a complete `prompt`, a short `name`, and optionally an `agent`, `model`, or `directory`. The new agent cannot see your conversation. Include the task, relevant paths, constraints, expected result, and how to verify it.
-- Any configured agent can be used, including primary agents like `build` or `plan`. A model is `provider/model` or `provider/model#variant`; omit it to use the agent's model. Do not guess unavailable agent or model IDs.
-- `directory` defaults to yours; relative paths resolve against your session directory. Agents share that working directory unless you select a different one; spawning does not create a worktree.
-- `agents_send`: use `to` (the name or session ID) and `message` to ask a follow-up, correct course, or give another task in the same conversation. Reuse an agent when its existing context is useful instead of spawning a replacement.
+By default the tools are in Code Mode: call them inside `execute` as `tools.agents.spawn(input)`, `tools.agents.send(input)`, `tools.agents.read(input)`, `tools.agents.list(input)`, and `tools.agents.stop(input)`, and `await` each call. When the plugin is configured with `codemode: false`, they are direct tools named `agents_spawn`, `agents_send`, and so on. Messages and results name the exact call to use. If unsure, run `search({ namespace: "agents" })` inside `execute`.
 
-Example tool inputs:
+Below, `spawn`, `send`, and the rest mean whichever form is available.
 
-```json
-{"name":"reviewer","agent":"plan","prompt":"Review src/auth for correctness. Do not edit files. Return prioritized findings with file paths and tests to add."}
+## Spawn an agent
+
+`spawn` takes a complete `prompt`, a short `name`, and optionally an `agent`, `model`, or `directory`. It returns at once; the agent works in its own session.
+
+- The agent cannot see your conversation. Include the task, relevant paths, constraints, how to verify it, and what to send back to you.
+- Any configured agent can be used, including primary agents like `build` or `plan`. A model is `provider/model` or `provider/model#variant`; omit it to use the agent's model. Do not guess agent or model IDs.
+- `directory` defaults to yours; relative paths resolve against your directory. Agents share the working tree unless you choose another directory; spawning does not create a worktree.
+- To send a brief that already exists as a file (a plan, a task spec), pass `file` with its path instead of pasting it into `prompt`. With both, `prompt` comes first, then the file. `send` takes `file` the same way. Files over 256 KB are refused.
+
+```js
+await tools.agents.spawn({ name: "reviewer", agent: "plan", prompt: "Review src/auth for correctness. Do not edit files. Send me prioritized findings with file paths and tests to add." })
 ```
 
-```json
-{"to":"reviewer","message":"Check whether the fix in src/auth/session.ts resolves your first finding."}
+## Message and reply
+
+`send` takes `to` (an agent's name, or any session's ID) and `message`. It never waits. The receiver sees your message headed with who sent it and your session ID.
+
+- Replies arrive in your session as new messages headed `[opencode-agents] This message is from …`. Do not poll for them; carry on with other work or end your turn, and the reply wakes you.
+- When you receive such a message, it is from another agent, not the user. If it asks for something, do it and send the answer or result back with `send` to the session ID in the header. Do not reply only to acknowledge or thank; that starts an endless exchange.
+- For a busy receiver, `delivery: "steer"` (default) delivers at its next step; `delivery: "queue"` waits for its current turn to finish.
+- Reuse an agent whose context is useful instead of spawning a replacement.
+
+```js
+await tools.agents.send({ to: "reviewer", message: "Check whether the fix in src/auth/session.ts resolves your first finding." })
 ```
 
-## Wait or work in parallel
+## Check on agents
 
-- Spawn and send wait for a reply by default. Use `wait: false` for independent work while you continue elsewhere; the reply arrives later as a notification that wakes your session.
-- `timeoutSeconds` bounds a foreground wait, not the agent's task. At the timeout (600 seconds by default), the wait becomes a background notification rather than failing.
-- For a busy agent, `delivery: "steer"` (default) delivers at its next step. Use `delivery: "queue"` to wait until its current turn finishes before the next task is delivered.
-- `agents_read` takes `from`; it shows status and the latest reply. `messages: 10` shows recent conversation, and `wait: true` waits for the current turn. Prefer notifications to repeated polling.
-- `agents_list` lists your agents and, if you are a spawned agent, your siblings.
+- `read` with `from` shows whether an agent is working, idle, or failed, and its latest reply; `messages: 10` shows recent conversation. It does not wait.
+- `list` lists agents in this project; `scope: "global"` lists every project.
+- Names are unique within a project. A name is looked up in your project first, then in other projects; if several projects have it, use the session ID.
 
-Assign non-overlapping files or separate worktrees to agents making concurrent edits. Keep read-only reviews explicit. Verify agents' findings and changed files before integrating them; their replies are reports, not proof that checks passed.
+## Stop and clean up
 
-## Siblings, nesting, and cleanup
+Only the session that spawned an agent can stop it.
 
-Spawned agents may spawn their own agents; the plugin has no agent-count or nesting-depth limit. Do not fan out recursively without a concrete need: each session consumes tokens and may make changes.
+- `stop` with `name` interrupts the agent and keeps its session; message it again to continue.
+- `remove: true` also deletes its session. Use it only when the conversation is no longer needed; it does not undo file changes.
 
-Spawned agents can send messages to siblings by name. Sibling sends always return immediately to avoid mutual waits; replies arrive as notifications. Only the session that spawned an agent can stop it.
+## Work safely
 
-- `agents_stop` with `name` interrupts an agent but preserves its context. Send another message to continue it later.
-- `remove: true` also deletes its session and descendants. Use it only when that conversation is no longer needed; it does not undo filesystem changes.
-- Stopping your session during a foreground wait interrupts the agent being waited on. A background agent can continue after your turn ends.
-
-Agents are child sessions visible in OpenCode's session list, where the user can open and talk to them directly. Sessions inherit the parent's permission rules; never delegate an operation to bypass a denial or approval requirement.
-
-If these tools are hidden, ask Chauffeur to reveal `agents_spawn`, `agents_send`, `agents_read`, `agents_list`, and `agents_stop`. With the plugin's `codemode: true` option, discover their exact paths using `search({ namespace: "agents" })` inside `execute`.
+- Give agents making concurrent edits non-overlapping files or separate worktrees. Make read-only reviews explicit.
+- Verify agents' findings and changed files before relying on them; a reply is a report, not proof that checks passed.
+- Agents get the normal permission rules for their agent and config. Never delegate an operation to get around a denial or an approval requirement.
+- Spawned agents can spawn and message others; do not fan out without a concrete need, since every session uses tokens and may change files.

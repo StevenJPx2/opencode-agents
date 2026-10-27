@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { statusOf, transcript, turnAfter, type Message } from "../src/transcript.ts"
+import { latestTurn, statusOf, transcript, type Message } from "../src/transcript.ts"
 
 const user = (id: string, text: string): Message => ({ id, type: "user", text })
 const said = (id: string, text: string, tools: string[] = []): Message => ({
@@ -10,28 +10,28 @@ const said = (id: string, text: string, tools: string[] = []): Message => ({
 const idle = (id: string, error?: string): Message => (error ? { id, type: "idle", error: { type: "provider", message: error } } : { id, type: "idle" })
 
 test("the reply is the last assistant text before the turn's idle marker", () => {
-  const messages = [user("m1", "hi"), said("a1", "", ["glob"]), said("a2", "pong"), idle("i1"), user("m2", "again"), said("a3", "later")]
+  const messages = [user("m1", "hi"), said("a1", "", ["glob"]), said("a2", "pong"), idle("i1")]
 
-  expect(turnAfter(messages, "m1")).toEqual({ status: "done", reply: "pong", toolCalls: 1 })
+  expect(latestTurn(messages)).toEqual({ status: "done", reply: "pong", toolCalls: 1 })
 })
 
 test("a turn without an idle marker is still running", () => {
   const messages = [user("m1", "hi"), said("a1", "thinking", ["read"])]
 
-  expect(turnAfter(messages, "m1")).toEqual({ status: "running", reply: "thinking", toolCalls: 1 })
+  expect(latestTurn(messages)).toEqual({ status: "running", reply: "thinking", toolCalls: 1 })
 })
 
 test("an idle marker with an error fails the turn", () => {
   const messages = [user("m1", "hi"), idle("i1", "Model unavailable")]
 
-  expect(turnAfter(messages, "m1")).toEqual({ status: "failed", reply: "", error: "Model unavailable", toolCalls: 0 })
+  expect(latestTurn(messages)).toEqual({ status: "failed", reply: "", error: "Model unavailable", toolCalls: 0 })
 })
 
-test("without a message ID, or with one no longer in context, the latest user message is used", () => {
+test("the latest user message's turn is reported, not an earlier one", () => {
   const messages = [user("m1", "one"), said("a1", "first"), idle("i1"), user("m2", "two"), said("a2", "second"), idle("i2")]
 
-  expect(turnAfter(messages).reply).toBe("second")
-  expect(turnAfter(messages, "gone").reply).toBe("second")
+  expect(latestTurn(messages).reply).toBe("second")
+  expect(latestTurn([...messages, user("m3", "three")])).toEqual({ status: "running", reply: "", toolCalls: 0 })
 })
 
 test("status follows the last conversation message", () => {

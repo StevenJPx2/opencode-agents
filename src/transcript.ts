@@ -40,20 +40,14 @@ const lastIndex = <T>(items: ReadonlyArray<T>, match: (item: T) => boolean): num
   return -1
 }
 
-/**
- * The turn that answers `messageID`, or the latest user message when it is not
- * given or no longer in the context (after compaction, say).
- */
-export function turnAfter(messages: ReadonlyArray<Message>, messageID?: string): Turn {
-  let start = messageID === undefined ? -1 : messages.findIndex((message) => message.id === messageID)
-
-  if (start === -1) start = lastIndex(messages, (message) => message.type === "user")
-
+/** The turn that answers the latest user message. */
+export function latestTurn(messages: ReadonlyArray<Message>): Turn {
+  const start = lastIndex(messages, (message) => message.type === "user")
   let reply = ""
   let toolCalls = 0
   let ended: Message | undefined
 
-  // The first idle marker after the message closes the turn that answered it.
+  // The first idle marker after the message closes the turn that answers it.
   for (const message of messages.slice(start + 1)) {
     if (message.type === "idle") {
       ended = message
