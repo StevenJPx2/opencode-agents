@@ -1,6 +1,6 @@
 ---
 name: opencode-agents
-description: Use when spawning another OpenCode agent, messaging an agent or another session, replying to a message headed "[opencode-agents]", running work in parallel across agents, or asking another agent for a review. Covers the agents tools (spawn, send, read, list, stop), reached in Code Mode as tools.agents.* or directly as agents_*.
+description: Use when spawning another OpenCode agent, messaging an agent or another session, replying to a message headed "[opencode-agents]", running work in parallel across agents, or asking another agent for a review. Covers the agents tools (spawn, adopt, send, read, list, stop), reached in Code Mode as tools.agents.* or directly as agents_*.
 ---
 
 # OpenCode agents
@@ -9,7 +9,7 @@ The `opencode-agents` plugin lets you spawn agents and talk to them as peers. Ea
 
 ## Calling the tools
 
-By default the tools are in Code Mode: call them inside `execute` as `tools.agents.spawn(input)`, `tools.agents.send(input)`, `tools.agents.read(input)`, `tools.agents.list(input)`, and `tools.agents.stop(input)`, and `await` each call. When the plugin is configured with `codemode: false`, they are direct tools named `agents_spawn`, `agents_send`, and so on. Messages and results name the exact call to use. If unsure, run `search({ namespace: "agents" })` inside `execute`.
+By default the tools are in Code Mode: call them inside `execute` as `tools.agents.spawn(input)`, `tools.agents.send(input)`, `tools.agents.read(input)`, `tools.agents.list(input)`, `tools.agents.stop(input)`, and `tools.agents.adopt(input)`, and `await` each call. When the plugin is configured with `codemode: false`, they are direct tools named `agents_spawn`, `agents_send`, and so on. Messages and results name the exact call to use. If unsure, run `search({ namespace: "agents" })` inside `execute`.
 
 Below, `spawn`, `send`, and the rest mean whichever form is available.
 
@@ -18,12 +18,24 @@ Below, `spawn`, `send`, and the rest mean whichever form is available.
 `spawn` takes a complete `prompt`, a short `name`, and optionally an `agent`, `model`, or `directory`. It returns at once; the agent works in its own session.
 
 - The agent cannot see your conversation. Include the task, relevant paths, constraints, how to verify it, and what to send back to you.
-- Any configured agent can be used, including primary agents like `build` or `plan`. A model is `provider/model` or `provider/model#variant`; omit it to use the agent's model. Do not guess agent or model IDs.
+- Any configured agent can be used, including primary agents like `build` or `plan`. Without `agent`, it runs `build` (or the first visible primary agent), not a configured `default_agent`, so the agent that is permission-checked is the one that runs; pass `agent` to choose. A model is `provider/model` or `provider/model#variant`; omit it to use the agent's model. Do not guess agent or model IDs.
 - `directory` defaults to yours; relative paths resolve against your directory. Agents share the working tree unless you choose another directory; spawning does not create a worktree.
 - To send a brief that already exists as a file (a plan, a task spec), pass `file` with its path instead of pasting it into `prompt`. With both, `prompt` comes first, then the file. `send` takes `file` the same way. Files over 256 KB are refused.
 
 ```js
 await tools.agents.spawn({ name: "reviewer", agent: "plan", prompt: "Review src/auth for correctness. Do not edit files. Send me prioritized findings with file paths and tests to add." })
+```
+
+## Adopt a session
+
+`adopt` takes over a session that already exists, by name or session ID: your session becomes its owner, it is marked as an agent you can address by name, and optional `agent` and `model` switch what it runs for its next turns. It sends no message; follow with `send` to give it work.
+
+- It keeps the agent's name, or names a plain session after its title, unless you pass `name`. Names are made unique in the project.
+- Adopting an agent another session owns makes you its owner; the result names the previous owner. Tell that owner when it is still active.
+
+```js
+await tools.agents.adopt({ session: "ses_e27a…", name: "auth-fix", agent: "worker" })
+await tools.agents.send({ to: "auth-fix", message: "Finish the session-expiry fix and send me the test results." })
 ```
 
 ## Message and reply
@@ -47,7 +59,7 @@ await tools.agents.send({ to: "reviewer", message: "Check whether the fix in src
 
 ## Stop and clean up
 
-Only the session that spawned an agent can stop it.
+Only an agent's owner, the session that spawned or last adopted it, can stop it.
 
 - `stop` with `name` interrupts the agent and keeps its session; message it again to continue.
 - `remove: true` also deletes its session. Use it only when the conversation is no longer needed; it does not undo file changes.
@@ -56,5 +68,5 @@ Only the session that spawned an agent can stop it.
 
 - Give agents making concurrent edits non-overlapping files or separate worktrees. Make read-only reviews explicit.
 - Verify agents' findings and changed files before relying on them; a reply is a report, not proof that checks passed.
-- Agents get the normal permission rules for their agent and config. Never delegate an operation to get around a denial or an approval requirement.
+- Agents get the normal permission rules for their agent and config. `spawn` checks the `agents_spawn` action and `adopt` the `agents_adopt` action, each with the agent that would run as the resource; an agent such as a worker may be denied both, and then the tools are missing or fail with a permission error. Do not try to get around that, or any other denial or approval requirement, by asking another agent to do it.
 - Spawned agents can spawn and message others; do not fan out without a concrete need, since every session uses tokens and may change files.

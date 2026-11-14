@@ -1,13 +1,34 @@
 import { expect, test } from "bun:test"
+import { denied } from "../src/permissions.ts"
 import type { Message } from "../src/transcript.ts"
-import { Agents, codeModeCall, directCall, MARKER_KEY, markerOf, parseModel, slug, uniqueName, type Call, type Delivery, type Host, type SessionInfo } from "../src/agents.ts"
+import { Agents, codeModeCall, directCall, MARKER_KEY, markerOf, parseModel, slug, uniqueName, type Action, type Call, type Delivery, type Host, type SessionInfo, type ToolCall } from "../src/agents.ts"
 
 const PROJECTS: Record<string, string> = { "/work": "prj_work", "/other": "prj_other" }
 
 const say = (text: string) => ({ text })
 
+const call = (sessionID: string, agent = "build"): ToolCall => ({ sessionID, agent, messageID: "msg_1", id: "call_1" })
+
+/** A permission rule as OpenCode matches it: the last rule whose action and resource patterns match wins. */
+type Rule = { readonly action: string; readonly resource: string; readonly effect: "allow" | "deny" }
+
+const BASE_POLICY: Rule[] = [{ action: "*", resource: "*", effect: "allow" }]
+
+const matches = (pattern: string, value: string) =>
+  new RegExp(`^${pattern.split("*").map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`).test(value)
+
+/** Fails the way OpenCode does: a deny rejects with a tagged Tool.Error carrying the reason. */
+function evaluate(rules: Record<string, Rule[]>, input: ToolCall, action: Action, resource: string): Promise<void> {
+  const policy = [...BASE_POLICY, ...(rules[input.agent] ?? [])]
+  const rule = policy.findLast((rule) => matches(rule.action, action) && matches(rule.resource, resource))
+
+  if (rule?.effect === "deny") return Promise.reject({ _tag: "Tool.Error", message: `Denied by rule ${action}:${rule.resource}` })
+
+  return Promise.resolve()
+}
+
 /** An in-memory OpenCode. Sessions belong to the project of their directory; prompts are recorded, and `reply` answers one. */
-function harness(files: Record<string, string> = {}, call: Call = directCall) {
+function harness(files: Record<string, string> = {}, calls: Call = directCall, rules: Record<string, Rule[]> = {}) {
   const sessions = new Map<string, SessionInfo>([
     ["ses_root", { id: "ses_root", projectID: "prj_work", title: "Fix the login bug", location: { directory: "/work" } }],
     ["ses_away", { id: "ses_away", projectID: "prj_other", title: "Elsewhere", location: { directory: "/other" } }],
@@ -15,6 +36,7 @@ function harness(files: Record<string, string> = {}, call: Call = directCall) {
   const messages = new Map<string, Message[]>()
   const prompts: Array<{ sessionID: string; text: string; delivery: Delivery; from: string }> = []
   const interrupted: string[] = []
+  const checks: Array<{ sessionID: string; agent: string; action: Action; resource: string }> = []
   let next = 0
 
   const host: Host = {
@@ -55,6 +77,17 @@ function harness(files: Record<string, string> = {}, call: Call = directCall) {
     remove: async (sessionID) => {
       sessions.delete(sessionID)
     },
+    switchAgent: async (sessionID, agent) => {
+      sessions.set(sessionID, { ...sessions.get(sessionID)!, agent })
+    },
+    switchModel: async (sessionID, model) => {
+      sessions.set(sessionID, { ...sessions.get(sessionID)!, model })
+    },
+    defaultAgent: async () => "build",
+    assert: async (input, action, resource) => {
+      checks.push({ sessionID: input.sessionID, agent: input.agent, action, resource })
+      await evaluate(rules, input, action, resource).catch((error: unknown) => Promise.reject(denied(error, action, resource)))
+    },
     readText: async (path) => files[path] ?? Promise.reject(new Error("ENOENT: no such file or directory")),
   }
 
@@ -63,13 +96,13 @@ function harness(files: Record<string, string> = {}, call: Call = directCall) {
   }
   const named = (name: string) => [...sessions.values()].find((info) => markerOf(info)?.name === name)!
 
-  return { agents: new Agents(host, call), sessions, prompts, interrupted, reply, named }
+  return { agents: new Agents(host, calls), sessions, prompts, interrupted, checks, reply, named }
 }
 
 test("spawn creates a top-level agent session and returns without waiting", async () => {
   const { agents, prompts, named } = harness()
 
-  const out = await agents.spawn("ses_root", { prompt: say("map the repo"), agent: "explore", model: "anthropic/claude-haiku-5-5" })
+  const out = await agents.spawn(call("ses_root"), { prompt: say("map the repo"), agent: "explore", model: "anthropic/claude-haiku-5-5" })
   const agent = named("explore")
 
   expect(out).toContain('Spawned agent "explore" (explore, anthropic/claude-haiku-5-5')
@@ -83,7 +116,7 @@ test("spawn creates a top-level agent session and returns without waiting", asyn
 test("every message names its sender and how to reply", async () => {
   const { agents, prompts, named } = harness()
 
-  await agents.spawn("ses_root", { prompt: say("review src/auth"), name: "reviewer" })
+  await agents.spawn(call("ses_root"), { prompt: say("review src/auth"), name: "reviewer" })
   await agents.send(named("reviewer").id, { to: "ses_root", message: say("Found two issues."), delivery: "queue" })
 
   const [first, answer] = prompts
@@ -92,13 +125,13 @@ test("every message names its sender and how to reply", async () => {
   expect(first?.text).toStartWith('[opencode-agents] This message is from session "Fix the login bug" (ses_root), not from the user.')
   expect(first?.text).toContain('calling agents_send with to: "ses_root"')
   expect(first?.text).toEndWith("\n\nreview src/auth")
-  expect(answer).toEqual({ sessionID: "ses_root", text: expect.stringContaining(`agent "reviewer" (${reviewer})`), delivery: "queue", from: reviewer })
+  expect(answer).toEqual({ sessionID: "ses_root", text: expect.stringContaining(`agent "reviewer" (build, ${reviewer})`), delivery: "queue", from: reviewer })
 })
 
 test("in Code Mode, messages and results name the Code Mode calls", async () => {
   const { agents, prompts } = harness({}, codeModeCall)
 
-  expect(await agents.spawn("ses_root", { prompt: say("go"), name: "w" })).toContain("messages you back with tools.agents.send in execute")
+  expect(await agents.spawn(call("ses_root"), { prompt: say("go"), name: "w" })).toContain("messages you back with tools.agents.send in execute")
   expect(prompts[0]?.text).toContain('calling tools.agents.send in execute with to: "ses_root"')
   await expect(agents.send("ses_root", { to: "nobody", message: say("hi"), delivery: "steer" })).rejects.toThrow('Call tools.agents.list in execute with scope: "global"')
 })
@@ -106,7 +139,7 @@ test("in Code Mode, messages and results name the Code Mode calls", async () => 
 test("a message can be loaded from a file, relative to the sender, after any text", async () => {
   const { agents, prompts } = harness({ "/work/plans/task.md": "# Task\n\nShip it.", "/abs/notes.md": "notes" })
 
-  await agents.spawn("ses_root", { prompt: { file: "plans/task.md" }, name: "w" })
+  await agents.spawn(call("ses_root"), { prompt: { file: "plans/task.md" }, name: "w" })
   await agents.send("ses_root", { to: "w", message: { text: "Also read these:", file: "/abs/notes.md" }, delivery: "steer" })
 
   expect(prompts[0]?.text).toEndWith("\n\n# Task\n\nShip it.")
@@ -116,8 +149,8 @@ test("a message can be loaded from a file, relative to the sender, after any tex
 test("a missing message, file, or file content is an error and spawns nothing", async () => {
   const { agents, sessions } = harness({ "/work/empty.md": "  \n" })
 
-  await expect(agents.spawn("ses_root", { prompt: {} })).rejects.toThrow("Give the message text, a file to load it from, or both.")
-  await expect(agents.spawn("ses_root", { prompt: { file: "missing.md" } })).rejects.toThrow("Cannot read the message file /work/missing.md: ENOENT")
+  await expect(agents.spawn(call("ses_root"), { prompt: {} })).rejects.toThrow("Give the message text, a file to load it from, or both.")
+  await expect(agents.spawn(call("ses_root"), { prompt: { file: "missing.md" } })).rejects.toThrow("Cannot read the message file /work/missing.md: ENOENT")
   await expect(agents.send("ses_root", { to: "ses_away", message: { file: "empty.md" }, delivery: "steer" })).rejects.toThrow("The message file /work/empty.md is empty.")
   expect(sessions.size).toBe(2)
 })
@@ -125,9 +158,9 @@ test("a missing message, file, or file content is an error and spawns nothing", 
 test("names are unique within a project but may repeat across projects", async () => {
   const { agents, sessions } = harness()
 
-  await agents.spawn("ses_root", { prompt: say("a"), agent: "build" })
-  await agents.spawn("ses_root", { prompt: say("b"), agent: "build" })
-  await agents.spawn("ses_root", { prompt: say("c"), agent: "build", directory: "../other" })
+  await agents.spawn(call("ses_root"), { prompt: say("a"), agent: "build" })
+  await agents.spawn(call("ses_root"), { prompt: say("b"), agent: "build" })
+  await agents.spawn(call("ses_root"), { prompt: say("c"), agent: "build", directory: "../other" })
 
   const names = [...sessions.values()].flatMap((info) => {
     const marker = markerOf(info)
@@ -141,7 +174,7 @@ test("names are unique within a project but may repeat across projects", async (
 test("concurrent spawns of one name still get distinct names", async () => {
   const { agents, sessions } = harness()
 
-  await Promise.all([1, 2, 3].map((index) => agents.spawn("ses_root", { prompt: say(`task ${index}`), name: "worker" })))
+  await Promise.all([1, 2, 3].map((index) => agents.spawn(call("ses_root"), { prompt: say(`task ${index}`), name: "worker" })))
 
   expect([...sessions.values()].flatMap((info) => markerOf(info)?.name ?? []).sort()).toEqual(["worker", "worker-2", "worker-3"])
 })
@@ -149,12 +182,12 @@ test("concurrent spawns of one name still get distinct names", async () => {
 test("a name resolves in this project first, then in a single other project", async () => {
   const { agents, prompts, named } = harness()
 
-  await agents.spawn("ses_away", { prompt: say("a"), name: "remote" })
+  await agents.spawn(call("ses_away"), { prompt: say("a"), name: "remote" })
   await agents.send("ses_root", { to: "Remote", message: say("hello"), delivery: "steer" })
 
   expect(prompts.at(-1)?.sessionID).toBe(named("remote").id)
 
-  await agents.spawn("ses_root", { prompt: say("b"), name: "remote" })
+  await agents.spawn(call("ses_root"), { prompt: say("b"), name: "remote" })
   await agents.send("ses_root", { to: "remote", message: say("hi"), delivery: "steer" })
 
   expect(prompts.at(-1)?.sessionID).not.toBe(named("remote").id)
@@ -163,12 +196,12 @@ test("a name resolves in this project first, then in a single other project", as
 test("an ambiguous or unknown name is an error that says what to do", async () => {
   const { agents } = harness()
 
-  await agents.spawn("ses_root", { prompt: say("a"), name: "twin" })
+  await agents.spawn(call("ses_root"), { prompt: say("a"), name: "twin" })
 
   await expect(agents.send("ses_0", { to: "nobody", message: say("hi"), delivery: "steer" })).rejects.toThrow('Agents in this project: "twin"')
 
-  await agents.spawn("ses_away", { prompt: say("b"), name: "solo" })
-  await agents.spawn("ses_away", { prompt: say("c"), directory: "/elsewhere", name: "solo" })
+  await agents.spawn(call("ses_away"), { prompt: say("b"), name: "solo" })
+  await agents.spawn(call("ses_away"), { prompt: say("c"), directory: "/elsewhere", name: "solo" })
 
   await expect(agents.send("ses_root", { to: "solo", message: say("hi"), delivery: "steer" })).rejects.toThrow("Address one by its session ID")
 })
@@ -185,7 +218,7 @@ test("any session can be messaged by ID, but not the caller itself", async () =>
 test("read reports status and the latest reply, or a transcript, without waiting", async () => {
   const { agents, reply, named } = harness()
 
-  await agents.spawn("ses_root", { prompt: say("hi"), name: "w" })
+  await agents.spawn(call("ses_root"), { prompt: say("hi"), name: "w" })
 
   expect(await agents.read("ses_root", { from: "w", messages: 0 })).toContain("is working.")
 
@@ -198,14 +231,14 @@ test("read reports status and the latest reply, or a transcript, without waiting
 test("list covers this project by default and every project when global", async () => {
   const { agents, reply, named } = harness()
 
-  await agents.spawn("ses_root", { prompt: say("a"), name: "mine" })
-  await agents.spawn("ses_away", { prompt: say("b"), name: "theirs" })
+  await agents.spawn(call("ses_root"), { prompt: say("a"), name: "mine" })
+  await agents.spawn(call("ses_away"), { prompt: say("b"), name: "theirs" })
   reply(named("mine").id, "ok")
 
   const project = await agents.list("ses_root", "project")
 
   expect(project).toContain('"mine"')
-  expect(project).toContain("idle, spawned by you")
+  expect(project).toContain("idle, owned by you")
   expect(project).not.toContain('"theirs"')
 
   const global = await agents.list("ses_root", "global")
@@ -216,21 +249,106 @@ test("list covers this project by default and every project when global", async 
   expect(await harness().agents.list("ses_root", "project")).toContain('Use scope: "global"')
 })
 
-test("only the session that spawned an agent can stop or remove it", async () => {
+test("only an agent's owner can stop or remove it", async () => {
   const { agents, sessions, interrupted, named } = harness()
 
-  await agents.spawn("ses_root", { prompt: say("a"), name: "alice" })
-  await agents.spawn("ses_root", { prompt: say("b"), name: "bob" })
+  await agents.spawn(call("ses_root"), { prompt: say("a"), name: "alice" })
+  await agents.spawn(call("ses_root"), { prompt: say("b"), name: "bob" })
 
   const bob = named("bob")
 
-  await expect(agents.stop(named("alice").id, { name: "bob", remove: true })).rejects.toThrow("Only the session that spawned an agent")
-  await expect(agents.stop("ses_root", { name: "ses_away", remove: false })).rejects.toThrow("was not spawned by this session")
+  await expect(agents.stop(named("alice").id, { name: "bob", remove: true })).rejects.toThrow("Only the session that spawned or adopted an agent")
+  await expect(agents.stop("ses_root", { name: "ses_away", remove: false })).rejects.toThrow("is not owned by this session")
 
   expect(await agents.stop("ses_root", { name: "bob", remove: false })).toContain("Interrupted")
   expect(interrupted).toEqual([bob.id])
   expect(await agents.stop("ses_root", { name: bob.id, remove: true })).toContain("Removed")
   expect(sessions.has(bob.id)).toBe(false)
+})
+
+const WORKER: Rule[] = [
+  { action: "agents_spawn", resource: "*", effect: "deny" },
+  { action: "agents_adopt", resource: "*", effect: "deny" },
+]
+
+test("spawn checks agents_spawn on the agent it runs, the default agent when none is given", async () => {
+  const { agents, checks, named } = harness()
+
+  await agents.spawn(call("ses_root"), { prompt: say("a"), agent: "explore" })
+  await agents.spawn(call("ses_root"), { prompt: say("b") })
+
+  expect(checks).toEqual([
+    { sessionID: "ses_root", agent: "build", action: "agents_spawn", resource: "explore" },
+    { sessionID: "ses_root", agent: "build", action: "agents_spawn", resource: "build" },
+  ])
+  expect(named("build").agent).toBe("build")
+})
+
+test("an agent whose rules deny agents_spawn cannot spawn, and nothing is created", async () => {
+  const { agents, sessions, prompts } = harness({}, directCall, { worker: WORKER })
+
+  await expect(agents.spawn(call("ses_root", "worker"), { prompt: say("a"), agent: "explore" })).rejects.toThrow(
+    'Permission denied: agents_spawn on "explore".',
+  )
+  await expect(agents.spawn(call("ses_root", "worker"), { prompt: say("a") })).rejects.toThrow('A rule { action: "agents_spawn", resource: "build" or a pattern matching it such as "*", effect: "deny" } applies')
+  expect(sessions.size).toBe(2)
+  expect(prompts).toEqual([])
+})
+
+test("a narrower rule can allow spawning one agent while denying the rest", async () => {
+  const rules = { lead: [{ action: "agents_spawn", resource: "*", effect: "deny" as const }, { action: "agents_spawn", resource: "explore", effect: "allow" as const }] }
+  const { agents } = harness({}, directCall, rules)
+
+  expect(await agents.spawn(call("ses_root", "lead"), { prompt: say("a"), agent: "explore" })).toContain("Spawned")
+  await expect(agents.spawn(call("ses_root", "lead"), { prompt: say("b"), agent: "build" })).rejects.toThrow("Permission denied")
+})
+
+test("adopt marks a session as an agent the caller owns and switches its agent and model", async () => {
+  const { agents, sessions, checks, prompts } = harness()
+
+  const out = await agents.adopt(call("ses_root"), { session: "ses_away", name: "Helper", agent: "worker", model: "anthropic/claude-haiku-5-5" })
+  const away = sessions.get("ses_away")!
+
+  expect(out).toStartWith('Adopted agent "helper" (worker, anthropic/claude-haiku-5-5, ses_away) in /other.')
+  expect(out).not.toContain("previous owner")
+  expect(markerOf(away)).toEqual({ name: "helper", spawnedBy: "ses_root" })
+  expect(away.title).toBe("helper")
+  expect(checks.at(-1)).toEqual({ sessionID: "ses_root", agent: "build", action: "agents_adopt", resource: "worker" })
+  expect(prompts).toEqual([])
+  expect(await agents.stop(call("ses_root").sessionID, { name: "helper", remove: false })).toContain("Interrupted")
+})
+
+test("adopt keeps an agent's name and agent by default and names the previous owner", async () => {
+  const { agents, checks, named } = harness()
+
+  await agents.spawn(call("ses_root"), { prompt: say("a"), name: "builder", agent: "plan" })
+
+  const builder = named("builder").id
+  const out = await agents.adopt(call("ses_away"), { session: builder })
+
+  expect(out).toContain('Adopted agent "builder" (plan, ' + builder + ")")
+  expect(out).toContain('Its previous owner was session "Fix the login bug" (ses_root).')
+  expect(checks.at(-1)?.resource).toBe("plan")
+  expect(markerOf(named("builder"))?.spawnedBy).toBe("ses_away")
+  await expect(agents.stop("ses_root", { name: builder, remove: true })).rejects.toThrow("is not owned by this session")
+})
+
+test("an adopted session without a name takes its title, made unique in its project", async () => {
+  const { agents, sessions } = harness()
+
+  await agents.spawn(call("ses_away"), { prompt: say("a"), name: "elsewhere" })
+
+  expect(await agents.adopt(call("ses_root"), { session: "ses_away" })).toContain('Address it as "elsewhere-2"')
+  expect(markerOf(sessions.get("ses_away")!)?.name).toBe("elsewhere-2")
+})
+
+test("an agent whose rules deny agents_adopt cannot adopt, and the session is unchanged", async () => {
+  const { agents, sessions } = harness({}, directCall, { worker: WORKER })
+  const before = sessions.get("ses_away")
+
+  await expect(agents.adopt(call("ses_root", "worker"), { session: "ses_away", agent: "build" })).rejects.toThrow('Permission denied: agents_adopt on "build".')
+  await expect(agents.adopt(call("ses_root"), { session: "ses_root" })).rejects.toThrow("That is this session")
+  expect(sessions.get("ses_away")).toBe(before)
 })
 
 test("names are slugs that can never be mistaken for session IDs", () => {

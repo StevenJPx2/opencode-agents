@@ -1,5 +1,7 @@
 import { Plugin } from "@opencode/plugin"
-import { Agents, codeModeCall, directCall, MARKER_KEY, type Delivery, type Host, type SessionInfo } from "./agents.ts"
+import { Agents, codeModeCall, directCall, MARKER_KEY, type Delivery, type Host, type SessionInfo, type ToolCall } from "./agents.ts"
+import { defaultAgent } from "./defaults.ts"
+import { denied } from "./permissions.ts"
 import { readText } from "./files.ts"
 import { listSessions } from "./sessions.ts"
 import type { Message } from "./transcript.ts"
@@ -29,6 +31,13 @@ const schema = (properties: Record<string, unknown>, required: string[] = []) =>
   additionalProperties: false,
 })
 
+const toolCall = (context: { sessionID: string; agent: string; messageID: string; id: string }): ToolCall => ({
+  sessionID: String(context.sessionID),
+  agent: String(context.agent),
+  messageID: String(context.messageID),
+  id: String(context.id),
+})
+
 const ADDRESS = "The agent's name, or the ID of any session. A name is looked up in this project first, then in every project."
 
 const FILE = {
@@ -47,7 +56,7 @@ export default Plugin.define({
           title: input.title,
           location: { directory: input.directory },
           metadata: { [MARKER_KEY]: input.marker },
-          ...(input.agent ? { agent: input.agent } : {}),
+          agent: input.agent,
           ...(input.model ? { model: input.model } : {}),
         })) as SessionInfo,
       rename: (sessionID, marker) => ctx.session.update({ sessionID, title: marker.name, metadata: { [MARKER_KEY]: marker } }),
@@ -61,6 +70,21 @@ export default Plugin.define({
         await ctx.session.interrupt({ sessionID, resume: false })
       },
       remove: (sessionID) => ctx.session.remove({ sessionID }),
+      switchAgent: (sessionID, agent) => ctx.session.switchAgent({ sessionID, agent }),
+      switchModel: (sessionID, model) => ctx.session.switchModel({ sessionID, model }),
+      defaultAgent: async (directory) => defaultAgent((await ctx.agent.list({ location: { directory } })).data),
+      assert: async (call, action, resource) => {
+        await ctx.permission
+          .assert({
+            sessionID: call.sessionID,
+            agent: call.agent,
+            source: { type: "tool", messageID: call.messageID, id: call.id },
+            action,
+            resources: [resource],
+            save: [resource],
+          })
+          .catch((error: unknown) => Promise.reject(denied(error, action, resource)))
+      },
       readText,
     }
 
@@ -101,12 +125,42 @@ export default Plugin.define({
           const input = raw as Input
 
           return {
-            content: await agents.spawn(String(context.sessionID), {
+            content: await agents.spawn(toolCall(context), {
               prompt: { text: text(input, "prompt"), file: text(input, "file") },
               name: text(input, "name"),
               agent: text(input, "agent"),
               model: text(input, "model"),
               directory: text(input, "directory"),
+            }),
+          }
+        },
+      })
+
+      editor.add({
+        name: "adopt",
+        description: [
+          "Take over an existing session as an agent this session owns, so it can be stopped or removed from here.",
+          "Optionally rename it and switch its agent or model for its next turns. It sends no message; use send for that.",
+        ].join(" "),
+        input: schema(
+          {
+            session: { type: "string", description: ADDRESS },
+            name: { type: "string", description: "Name to address it by; unique within its project. Defaults to its current agent name, else its title." },
+            agent: { type: "string", description: "Agent ID to switch it to, such as build or plan. Defaults to keeping its agent." },
+            model: { type: "string", description: "Model to switch it to, as provider/model. Defaults to keeping its model." },
+          },
+          ["session"],
+        ),
+        options,
+        execute: async (raw, context) => {
+          const input = raw as Input
+
+          return {
+            content: await agents.adopt(toolCall(context), {
+              session: required(input, "session"),
+              name: text(input, "name"),
+              agent: text(input, "agent"),
+              model: text(input, "model"),
             }),
           }
         },
@@ -176,7 +230,7 @@ export default Plugin.define({
 
       editor.add({
         name: "stop",
-        description: "Interrupt an agent this session spawned. Set remove: true to also delete its session.",
+        description: "Interrupt an agent this session spawned or adopted. Set remove: true to also delete its session.",
         input: schema(
           {
             name: { type: "string", description: "The agent's name or session ID." },

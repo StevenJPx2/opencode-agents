@@ -23,10 +23,11 @@ The tools live in OpenCode's Code Mode under the `agents` namespace, so they cos
 | Tool | What it does |
 |---|---|
 | `spawn` | Start an agent in a new top-level session and send it a first message (`prompt`, `file`, or both). Optional `name`, `agent`, `model` (`provider/model`), `directory`. Returns at once |
+| `adopt` | Take over an existing session by name or ID: this session becomes its owner, it is marked as an agent (optional `name`), and optional `agent` and `model` switch what it runs next. Sends no message |
 | `send` | Message an agent by name, or any session by ID (`message`, `file`, or both). Returns at once. `delivery: "queue"` waits for a busy receiver to finish its current turn instead of steering it |
 | `read` | Show whether an agent is working, idle, or failed, with its latest reply or its last `messages` messages |
 | `list` | List agents in this project with their status; `scope: "global"` lists every project |
-| `stop` | Interrupt an agent this session spawned; `remove: true` also deletes its session |
+| `stop` | Interrupt an agent this session owns; `remove: true` also deletes its session |
 
 For example:
 
@@ -44,11 +45,49 @@ You can talk to any agent directly from the session list. Your messages there ha
 
 Names are unique within a project (the same name can exist in two projects). A name is looked up in the caller's project first, then across every project when exactly one agent has it. A session ID always works, and reaches any session, including ones you started yourself.
 
-### Stopping
+### Default agent
 
-Any session can message any agent, but only the session that spawned an agent can stop or remove it. Removing deletes the session; it does not undo changes the agent made to files.
+`spawn` without `agent` runs `build`, or the first visible primary-capable agent when `build` is hidden or missing. It passes that agent to the new session explicitly, so the agent the permission check allowed is the agent that runs. Plugins cannot read `default_agent`, so this choice ignores it; pass `agent` to run another.
 
-Agents get the normal permission rules for their agent and your config.
+### Owners
+
+Every agent has one owner: the session that spawned it, or the session that last adopted it. Any session can message any agent, but only its owner can stop or remove it. Removing deletes the session; it does not undo changes the agent made to files.
+
+`adopt` hands an existing session to the caller, such as a supervisor taking over sessions the user started and switching them to a `worker` agent:
+
+```js
+await tools.agents.adopt({ session: "ses_e27a…", name: "auth-fix", agent: "worker" })
+```
+
+It keeps an agent's name unless `name` is given; an unnamed session is named after its title. Names stay unique in the project, with a suffix such as `-2` when taken. Adopting an agent that has another owner works, and the result names the previous owner.
+
+### Permissions
+
+Agents get the normal permission rules for their agent and your config. `spawn` and `adopt` also assert the caller's rules before acting:
+
+| Tool | Action | Resource |
+|---|---|---|
+| `spawn` | `agents_spawn` | The agent it runs: `agent`, or the default agent |
+| `adopt` | `agents_adopt` | The agent the session runs after adopting: `agent`, or its current agent |
+
+The default base policy allows every action, so no prompt appears unless a rule asks. An agent file can forbid both:
+
+```jsonc
+{
+  "agents": {
+    "worker": {
+      "permissions": [
+        { "action": "agents_spawn", "resource": "*", "effect": "deny" },
+        { "action": "agents_adopt", "resource": "*", "effect": "deny" },
+      ],
+    },
+  },
+}
+```
+
+A denied call fails with a message naming the action, the resource, and the rule that matches. Because each tool's own permission action is its ID (`agents_spawn`, `agents_adopt`), a blanket deny such as the one above also removes the tool from that agent's tool list. Narrower rules, such as denying `*` then allowing `explore`, keep the tool listed and allow only the matching agents.
+
+The check is the same inside Code Mode: `tools.agents.spawn` in `execute` runs with the calling session and its agent, so that agent's rules apply. An `ask` rule prompts on the call, and **Allow always** saves the agent ID as the pattern.
 
 ## Options
 

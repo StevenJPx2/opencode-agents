@@ -16,8 +16,17 @@ export type SessionInfo = {
   readonly location: { readonly directory: string }
 }
 
-/** An agent's address within its project, and the one session allowed to stop or remove it. */
+/**
+ * An agent's address within its project, and its owner: the one session allowed to stop or remove it.
+ * The owner, stored as `spawnedBy`, is the session that spawned or last adopted it.
+ */
 export type Marker = { readonly name: string; readonly spawnedBy: string }
+
+/** The tool call an action is made in, so a permission prompt attaches to it and the caller's agent's rules apply. */
+export type ToolCall = { readonly sessionID: string; readonly agent: string; readonly messageID: string; readonly id: string }
+
+/** Permission actions this plugin asserts; each takes the agent ID that would run as its resource. */
+export type Action = "agents_spawn" | "agents_adopt"
 
 export type Delivery = "steer" | "queue"
 
@@ -25,7 +34,7 @@ export type Scope = "project" | "global"
 
 /** What the agents need from OpenCode; the plugin wires it to the session API. */
 export interface Host {
-  create(input: { title: string; agent?: string; model?: ModelRef; directory: string; marker: Marker }): Promise<SessionInfo>
+  create(input: { title: string; agent: string; model?: ModelRef; directory: string; marker: Marker }): Promise<SessionInfo>
   /** Gives a session a new name: its title and its marker. */
   rename(sessionID: string, marker: Marker): Promise<void>
   get(sessionID: string): Promise<SessionInfo>
@@ -36,6 +45,12 @@ export interface Host {
   context(sessionID: string): Promise<ReadonlyArray<Message>>
   interrupt(sessionID: string): Promise<void>
   remove(sessionID: string): Promise<void>
+  switchAgent(sessionID: string, agent: string): Promise<void>
+  switchModel(sessionID: string, model: ModelRef): Promise<void>
+  /** The agent a session in `directory` runs when none is chosen. */
+  defaultAgent(directory: string): Promise<string>
+  /** Resolves once the caller's permission rules allow `action` on `resource`; rejects when they deny it. */
+  assert(call: ToolCall, action: Action, resource: string): Promise<void>
   /** Reads a text file given by absolute path. */
   readText(path: string): Promise<string>
 }
@@ -93,7 +108,7 @@ export function describe(info: SessionInfo): string {
   return `agent "${marker.name}" (${parts.filter(Boolean).join(", ")})`
 }
 
-export type ToolName = "spawn" | "send" | "read" | "list" | "stop"
+export type ToolName = "spawn" | "adopt" | "send" | "read" | "list" | "stop"
 
 /** How a model calls one of these tools, for the hints in messages and results. */
 export type Call = (tool: ToolName) => string
@@ -133,8 +148,9 @@ const LIST_CONCURRENCY = 8
 
 /**
  * Agents are ordinary top-level sessions any session can message. Calls are made
- * on behalf of a caller session, which only matters for naming the sender and for
- * stopping: an agent can be stopped or removed only by the session that spawned it.
+ * on behalf of a caller session, which matters for naming the sender, for permission
+ * checks on spawning and adopting, and for stopping: an agent can be stopped or removed
+ * only by its owner, the session that spawned or adopted it.
  */
 export class Agents {
   private naming: Promise<unknown> = Promise.resolve()
@@ -186,7 +202,7 @@ export class Agents {
   }
 
   async spawn(
-    callerID: string,
+    call: ToolCall,
     input: {
       readonly prompt: Body
       readonly name?: string | undefined
@@ -195,11 +211,15 @@ export class Agents {
       readonly directory?: string | undefined
     },
   ): Promise<string> {
-    const caller = await this.host.get(callerID)
+    const caller = await this.host.get(call.sessionID)
     const model = input.model ? parseModel(input.model) : undefined
     const directory = input.directory ? within(caller, input.directory) : caller.location.directory
     const prompt = await this.compose(caller, input.prompt)
-    const wanted = slug(input.name ?? input.agent ?? "agent")
+    // The checked agent is passed to create, so the agent that runs is always the one the rules allowed.
+    const agent = input.agent ?? (await this.host.defaultAgent(directory))
+    const wanted = slug(input.name ?? agent)
+
+    await this.host.assert(call, "agents_spawn", agent)
 
     // The new session's project is known only once it exists, so it is named after it is created.
     const info = await this.exclusive(async () => {
@@ -207,7 +227,7 @@ export class Agents {
         title: wanted,
         directory,
         marker: { name: wanted, spawnedBy: caller.id },
-        ...(input.agent ? { agent: input.agent } : {}),
+        agent,
         ...(model ? { model } : {}),
       })
       const taken = (await this.agents(created.projectID)).flatMap((other) => (other.id === created.id ? [] : [markerOf(other)?.name ?? ""]))
@@ -225,6 +245,49 @@ export class Agents {
     await this.deliver(caller, info, prompt, "steer")
 
     return `Spawned ${describe(info)} in ${info.location.directory} and sent it your message. It works on its own and messages you back with ${this.call("send")}; that reply arrives here as a new message. Address it as "${markerOf(info)?.name}".`
+  }
+
+  /**
+   * Makes the caller the owner of an existing session and marks it as an agent, optionally
+   * switching its agent and model. A session that already has an owner changes hands.
+   */
+  async adopt(
+    call: ToolCall,
+    input: {
+      readonly session: string
+      readonly name?: string | undefined
+      readonly agent?: string | undefined
+      readonly model?: string | undefined
+    },
+  ): Promise<string> {
+    const caller = await this.host.get(call.sessionID)
+    const target = await this.resolve(caller, input.session)
+
+    if (target.id === caller.id) throw new Error("That is this session. Adopt another session.")
+
+    const model = input.model ? parseModel(input.model) : undefined
+    const agent = input.agent ?? target.agent ?? (await this.host.defaultAgent(target.location.directory))
+    const previous = markerOf(target)
+
+    await this.host.assert(call, "agents_adopt", agent)
+
+    const wanted = slug(input.name ?? previous?.name ?? target.title ?? agent)
+
+    await this.exclusive(async () => {
+      const taken = (await this.agents(target.projectID)).flatMap((other) => (other.id === target.id ? [] : [markerOf(other)?.name ?? ""]))
+
+      await this.host.rename(target.id, { name: uniqueName(wanted, taken), spawnedBy: caller.id })
+    })
+
+    if (input.agent) await this.host.switchAgent(target.id, input.agent)
+    if (model) await this.host.switchModel(target.id, model)
+
+    const adopted = await this.host.get(target.id)
+    const lines = [`Adopted ${describe(adopted)} in ${adopted.location.directory}. This session owns it now: only this session can stop or remove it. Address it as "${markerOf(adopted)?.name}".`]
+
+    if (previous && previous.spawnedBy !== caller.id) lines.push(`Its previous owner was ${await this.owner(previous.spawnedBy)}.`)
+
+    return lines.join(" ")
   }
 
   async send(callerID: string, input: { readonly to: string; readonly message: Body; readonly delivery: Delivery }): Promise<string> {
@@ -262,7 +325,7 @@ export class Agents {
         const status = await this.host.context(info.id).then(statusOf, () => "unknown")
         const notes = [
           info.id === caller.id ? "this session" : undefined,
-          markerOf(info)?.spawnedBy === caller.id ? "spawned by you" : undefined,
+          markerOf(info)?.spawnedBy === caller.id ? "owned by you" : undefined,
           scope === "global" ? `in ${info.location.directory}` : undefined,
         ].filter(Boolean)
 
@@ -280,7 +343,7 @@ export class Agents {
     const target = await this.resolve(caller, input.name)
 
     if (markerOf(target)?.spawnedBy !== caller.id) {
-      throw new Error(`${describe(target)} was not spawned by this session. Only the session that spawned an agent can stop or remove it.`)
+      throw new Error(`${describe(target)} is not owned by this session. Only the session that spawned or adopted an agent can stop or remove it.`)
     }
 
     if (input.remove) {
@@ -292,6 +355,10 @@ export class Agents {
     await this.host.interrupt(target.id)
 
     return `Interrupted ${describe(target)}. Its session is kept; message it again to continue.`
+  }
+
+  private async owner(sessionID: string): Promise<string> {
+    return this.host.get(sessionID).then(describe, () => `session ${sessionID}, which no longer exists`)
   }
 
   private async compose(caller: SessionInfo, body: Body): Promise<string> {
